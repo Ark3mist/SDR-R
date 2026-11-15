@@ -26,6 +26,7 @@ public:
 
     // The band plan repeats every kPlanPeriodHz, anchored at 0 Hz RF.
     static constexpr double kPlanPeriodHz = 2.0e6;
+    static constexpr double kSimCtcssHz = 100.0;  // sub-tone on the NFM emitter
     static const std::vector<Emitter>& bandPlan();
 
     SimSource();
@@ -41,6 +42,9 @@ public:
     void setSampleRate(double sps) override { if (!running()) sampleRate_ = sps; }
     double sampleRate() const override { return sampleRate_; }
     std::vector<double> sampleRates() const override;
+    std::vector<float> gainSteps() const override;
+    float gain() const override { return gainDb.load(); }
+    void setGain(float db) override { gainDb.store(db); }
 
     // Live-adjustable parameters (UI thread writes, I/O thread reads).
     std::atomic<float> noiseDb{-48.0f};     // total noise power, dBFS
@@ -57,7 +61,7 @@ private:
 
     struct EmitterState {
         uint32_t modPhase = 0;                          // audio / keying phase
-        uint32_t pilotPhase = 0;                        // 19 kHz stereo pilot (WFM)
+        uint32_t pilotPhase = 0;                        // 19 kHz pilot (WFM) / CTCSS (NFM)
         uint32_t fmPhase = 0;                           // integrated FM phase
         float keyAmp = 0.0f;                            // smoothed CW keying envelope
         std::unordered_map<int64_t, uint32_t> carrier;  // per-replica NCO phase

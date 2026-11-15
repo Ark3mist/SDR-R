@@ -32,6 +32,14 @@ public:
     virtual double sampleRate() const = 0;
     virtual std::vector<double> sampleRates() const = 0;
 
+    // RF gain, generic across sources. gainSteps() lists the valid values (dB).
+    virtual std::vector<float> gainSteps() const { return {}; }
+    virtual float gain() const { return 0.0f; }
+    virtual void setGain(float /*db*/) {}
+
+    // Human-readable reason for the last start() failure / stream loss.
+    virtual std::string lastError() const { return {}; }
+
     // Bytes that could not be queued because the DSP thread fell behind.
     uint64_t overruns() const { return overruns_.load(std::memory_order_relaxed); }
 

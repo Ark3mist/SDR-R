@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OpenSDR-X VERSION 0.1.0 LANGUAGES C CXX)
+project(OpenSDR-X VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,49 +10,34 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# cardputer: SDL2 software-rendered 320x170 keyboard UI (no X11/Wayland/GL needed)
+# desktop:   GLFW + OpenGL 3.3 mouse UI (development rig)
+set(OPENSDRX_FRONTEND "cardputer" CACHE STRING "Front end to build: cardputer, desktop or both")
+set_property(CACHE OPENSDRX_FRONTEND PROPERTY STRINGS cardputer desktop both)
 option(OPENSDRX_BUILD_TESTS "Build headless unit tests" ON)
+
+set(BUILD_CARDPUTER OFF)
+set(BUILD_DESKTOP OFF)
+if(OPENSDRX_FRONTEND MATCHES "^(cardputer|both)$")
+    set(BUILD_CARDPUTER ON)
+endif()
+if(OPENSDRX_FRONTEND MATCHES "^(desktop|both)$")
+    set(BUILD_DESKTOP ON)
+endif()
+
+# Cardputer Zero = Raspberry Pi CM0 (Cortex-A53, aarch64).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=armv8-a+simd -mtune=cortex-a53")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -march=armv8-a+simd -mtune=cortex-a53")
+endif()
 
 include(FetchContent)
 find_package(Threads REQUIRED)
-find_package(OpenGL REQUIRED)
-find_package(PkgConfig)
+find_package(PkgConfig REQUIRED)
 
-# ---- GLFW (system package, else FetchContent) -------------------------------
-if(PkgConfig_FOUND)
-    pkg_check_modules(GLFW3 IMPORTED_TARGET glfw3>=3.3)
-endif()
-if(GLFW3_FOUND)
-    add_library(osx_glfw ALIAS PkgConfig::GLFW3)
-else()
-    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-    FetchContent_Declare(glfw
-        GIT_REPOSITORY https://github.com/glfw/glfw.git
-        GIT_TAG 3.4 GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(glfw)
-    add_library(osx_glfw ALIAS glfw)
-endif()
-
-# ---- GLEW --------------------------------------------------------------------
-find_package(GLEW REQUIRED)
-
-# ---- FFTW3 (single precision) -------------------------------------------------
-if(PkgConfig_FOUND)
-    pkg_check_modules(FFTW3F IMPORTED_TARGET fftw3f)
-endif()
-if(FFTW3F_FOUND)
-    add_library(osx_fftw3f ALIAS PkgConfig::FFTW3F)
-else()
-    find_library(FFTW3F_LIBRARY NAMES fftw3f libfftw3f-3 REQUIRED)
-    find_path(FFTW3F_INCLUDE_DIR fftw3.h REQUIRED)
-    add_library(osx_fftw3f_imp UNKNOWN IMPORTED)
-    set_target_properties(osx_fftw3f_imp PROPERTIES
-        IMPORTED_LOCATION "${FFTW3F_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${FFTW3F_INCLUDE_DIR}")
-    add_library(osx_fftw3f ALIAS osx_fftw3f_imp)
-endif()
+pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
+pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+pkg_check_modules(RTLSDR REQUIRED IMPORTED_TARGET librtlsdr)
 
 # ---- Dear ImGui (docking branch, pinned tag) -----------------------------------
 FetchContent_Declare(imgui
@@ -60,52 +45,84 @@ FetchContent_Declare(imgui
     GIT_TAG v1.92.5-docking GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(imgui)
 
-add_library(imgui STATIC
+add_library(imgui_core STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
-target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-target_link_libraries(imgui PUBLIC osx_glfw OpenGL::GL)
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp)
+target_include_directories(imgui_core PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 
-# ---- Core (GUI-independent: ring buffers, DSP, sources) -----------------------
+# ---- Engine (no GUI dependency): rings, DSP, sources, audio --------------------
 add_library(osx_core STATIC
+    src/audio/alsa_sink.cpp
     src/dsp/dsp_engine.cpp
+    src/dsp/receiver.cpp
     src/dsp/spectrum_analyzer.cpp
+    src/dsp/spectrum_data.cpp
+    src/engine/radio.cpp
+    src/source/rtlsdr_source.cpp
+    src/source/rtltcp_source.cpp
     src/source/sim_source.cpp)
 target_include_directories(osx_core PUBLIC src)
-target_link_libraries(osx_core PUBLIC osx_fftw3f Threads::Threads)
+target_link_libraries(osx_core PUBLIC PkgConfig::FFTW3F PkgConfig::ALSA PkgConfig::RTLSDR Threads::Threads)
+# The DSP inner loops are plain float dot products; let the compiler
+# reassociate them so they vectorise (NEON / SSE). No code relies on NaN/Inf.
+target_compile_options(osx_core PRIVATE -Wall -Wextra -Wpedantic -ffast-math)
 
-# ---- Application ----------------------------------------------------------------
-add_executable(opensdrx
-    src/main.cpp
-    src/gui/app.cpp
-    src/gui/theme.cpp
-    src/gui/colormaps.cpp
-    src/gui/frequency_select.cpp
-    src/gui/waterfall_gl.cpp
-    src/gui/spectrum_view.cpp)
-target_link_libraries(opensdrx PRIVATE osx_core imgui GLEW::GLEW OpenGL::GL)
-target_compile_definitions(opensdrx PRIVATE
-    OPENSDRX_VERSION="${PROJECT_VERSION}"
-    OPENSDRX_FONT_SRC_DIR="${imgui_SOURCE_DIR}/misc/fonts")
+# Theme + colormaps are shared by both front ends (ImGui core only).
+set(OSX_UI_COMMON src/gui/theme.cpp src/gui/colormaps.cpp)
 
-# Ship the UI font next to the binary (res/fonts/), SDR++ style.
-add_custom_command(TARGET opensdrx POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:opensdrx>/res/fonts
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf
-            $<TARGET_FILE_DIR:opensdrx>/res/fonts/Roboto-Medium.ttf)
+# ---- Cardputer Zero front end ---------------------------------------------------
+if(BUILD_CARDPUTER)
+    pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2>=2.0.18)
+    add_executable(cardsdr
+        src/cardputer/main.cpp
+        src/cardputer/ui.cpp
+        src/cardputer/video.cpp
+        src/cardputer/input.cpp
+        ${OSX_UI_COMMON}
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer2.cpp)
+    target_link_libraries(cardsdr PRIVATE osx_core imgui_core PkgConfig::SDL2)
+    target_compile_options(cardsdr PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_definitions(cardsdr PRIVATE
+        OPENSDRX_VERSION="${PROJECT_VERSION}"
+        OPENSDRX_FONT_SRC_DIR="${imgui_SOURCE_DIR}/misc/fonts")
+    add_custom_command(TARGET cardsdr POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:cardsdr>/res/fonts
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${imgui_SOURCE_DIR}/misc/fonts/ProggyTiny.ttf ${imgui_SOURCE_DIR}/misc/fonts/ProggyClean.ttf
+                $<TARGET_FILE_DIR:cardsdr>/res/fonts/)
+    install(TARGETS cardsdr RUNTIME DESTINATION bin)
+    install(FILES ${imgui_SOURCE_DIR}/misc/fonts/ProggyTiny.ttf ${imgui_SOURCE_DIR}/misc/fonts/ProggyClean.ttf
+            DESTINATION share/opensdrx/fonts)
+    install(PROGRAMS run_cardsdr.sh DESTINATION bin)
+endif()
 
-foreach(tgt osx_core opensdrx)
-    if(MSVC)
-        target_compile_options(${tgt} PRIVATE /W4 /D_USE_MATH_DEFINES /DNOMINMAX)
-    else()
-        target_compile_options(${tgt} PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-endforeach()
+# ---- Desktop front end (GLFW + OpenGL 3.3) ----------------------------------------
+if(BUILD_DESKTOP)
+    find_package(OpenGL REQUIRED)
+    find_package(GLEW REQUIRED)
+    pkg_check_modules(GLFW3 REQUIRED IMPORTED_TARGET glfw3>=3.3)
+    add_executable(opensdrx
+        src/main.cpp
+        src/gui/app.cpp
+        src/gui/frequency_select.cpp
+        src/gui/waterfall_gl.cpp
+        src/gui/spectrum_view.cpp
+        ${OSX_UI_COMMON}
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+    target_link_libraries(opensdrx PRIVATE osx_core imgui_core PkgConfig::GLFW3 GLEW::GLEW OpenGL::GL)
+    target_compile_options(opensdrx PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_definitions(opensdrx PRIVATE
+        OPENSDRX_VERSION="${PROJECT_VERSION}"
+        OPENSDRX_FONT_SRC_DIR="${imgui_SOURCE_DIR}/misc/fonts")
+    add_custom_command(TARGET opensdrx POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:opensdrx>/res/fonts
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf
+                $<TARGET_FILE_DIR:opensdrx>/res/fonts/Roboto-Medium.ttf)
+endif()
 
 if(OPENSDRX_BUILD_TESTS)
     enable_testing()

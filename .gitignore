@@ -5,3 +5,4 @@ imgui.ini
 compile_commands.json
 .vscode/
 .idea/
+*.bmp

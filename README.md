@@ -1,25 +1,35 @@
 # OpenSDR-X
 
-Cross-platform C++20 software-defined-radio receiver modelled on the SDR++ layout:
-GLFW + OpenGL 3.3 + Dear ImGui front end, FFTW3 display FFT, lock-free threaded I/Q pipeline.
+C++20 software-defined-radio receiver modelled on SDR++. One engine, two front ends:
 
-## Status
+| Target | Binary | Stack | Purpose |
+|--------|--------|-------|---------|
+| **M5Stack Cardputer Zero** (default) | `cardsdr` | SDL2 software renderer -> KMS/DRM window or raw `/dev/fb0`, evdev/SDL keyboard, ALSA | 320x170, keyboard only |
+| Desktop | `opensdrx` | GLFW + OpenGL 3.3 + Dear ImGui | development rig (mouse UI, spectrum only) |
 
-| Phase | Scope | State |
-|-------|-------|-------|
-| 1 | Window, theme, toolbar, FFT + GPU waterfall, simulated source, VFO interaction | **done** |
-| 2 | librtlsdr / rtl_tcp sources, multi-VFO polyphase DDC, demodulators, RtAudio | pending |
-| 3 | Noise blanker / NR, recorder, frequency manager, scanner | pending |
-| 4 | Network sinks, rigctld server | pending |
+## What exists
 
-Phase 1 produces no audio. The volume slider and mute button hold state only until the Phase 2 audio sink exists.
+| Area | State |
+|------|-------|
+| Sources: simulator, RTL-SDR (librtlsdr), rtl_tcp client | built |
+| DDC: NCO -> integer decimating FIR -> channel filter -> arbitrary resampler to 48 kHz | built |
+| Demodulators: WFM (stereo pilot PLL), NFM, AM, SAM (PLL), USB, LSB, CW, RAW | built |
+| Squelch, AGC (fast/medium/slow + hang), de-emphasis, CTCSS detector | built |
+| DC removal, Invert IQ | built |
+| ALSA sink, -6 dBFS hard limiter, mixer clamp | built |
+| 320x170 keyboard UI, software waterfall, 5 colormaps, 3 themes | built |
+| RDS decoder, DCS | **not built** |
+| IQ balance, noise blanker, spectral NR, notch / auto-notch | **not built** |
+| Recorder, frequency manager / bookmarks, scanner | **not built** |
+| UDP/TCP audio sink, rigctl server | **not built** |
+| Multi-VFO, IQ file player, SDR++ server client | **not built** |
 
-## Build
+Drawer tabs 4-6 and the `R` / `L` keys say so on screen rather than pretending.
 
-Linux (Debian/Ubuntu):
+## Build (on the Cardputer Zero / Raspberry Pi OS, aarch64)
 
 ```bash
-sudo apt install build-essential cmake ninja-build pkg-config libglfw3-dev libglew-dev libfftw3-dev libgl1-mesa-dev
+sudo apt install build-essential cmake ninja-build pkg-config git libsdl2-dev libfftw3-dev librtlsdr-dev libasound2-dev alsa-utils
 ```
 
 ```bash
@@ -35,36 +45,60 @@ ctest --test-dir build --output-on-failure
 ```
 
 ```bash
-./build/opensdrx --autostart
+./run_cardsdr.sh
 ```
 
-Dear ImGui (docking branch, pinned tag) is fetched by CMake. GLFW falls back to FetchContent when no system package is found.
-macOS and Windows code paths exist (forward-compat GL context, MSVC flags) but have **not** been built or tested yet.
+On aarch64 the build uses `-O3 -march=armv8-a+simd -mtune=cortex-a53`. The desktop rig is opt-in:
+`-DOPENSDRX_FRONTEND=desktop` (or `both`) and additionally needs `libglfw3-dev libglew-dev libgl1-mesa-dev`.
 
-## Threads (Phase 1)
+## Display and keyboard back ends
 
-| Thread | Owner | Work |
-|--------|-------|------|
-| I/O | `SimSource` | Generates interleaved uint8 I/Q in real time, writes to an SPSC lock-free ring |
-| DSP | `DspEngine` | uint8 -> `std::complex<float>`, IQ invert, DC-spike removal, feeds the spectrum tap ring |
-| FFT worker | `SpectrumAnalyzer` | Sliding history, window, `fftwf_plan_dft_1d`, publishes dBFS lines |
-| UI | `main` / `App` | 60 FPS ImGui frame, `glTexSubImage2D` ring-texture waterfall, shader colormap/scroll/zoom |
+`cardsdr` renders everything into one 320x170 ARGB surface with SDL's software renderer, then presents it one of two ways:
 
-The audio-sink thread arrives with Phase 2.
+| `--video` | Presentation | Keyboard | Needs |
+|-----------|--------------|----------|-------|
+| `sdl` | SDL window (`SDL_VIDEODRIVER=kmsdrm`, or x11/wayland for testing) | SDL key events | GBM/EGL on the panel's DRM node for KMSDRM |
+| `fbdev` | direct RGB565/XRGB8888 writes to `/dev/fb0` (auto-rotates a portrait panel, `--rotate` overrides) | Linux evdev, grabbed | read access to `/dev/fb0` and `/dev/input/event*` |
+| `auto` | tries `sdl`, falls back to `fbdev` | as above | |
 
-## Controls
+SDL2 has no `fbcon` driver (that was SDL 1.2), which is why the framebuffer path is implemented directly.
 
-| Action | Input |
-|--------|-------|
-| Tune VFO | Click or drag in the FFT / waterfall; scroll wheel = one snap step |
-| Filter bandwidth | Drag either passband edge |
-| Retune hardware centre | Drag the frequency scale |
-| Zoom / pan | Ctrl + wheel (about the cursor), middle-drag, or the Zoom strip |
-| dB range | Drag the dB scale, or the Max / Min strip |
-| Pane split | Drag the bar between FFT and waterfall |
-| Frequency digits | Click upper/lower half = +/-, wheel = +/-, right-click = zero lower digits |
-| Play / stop | Toolbar button or Space |
+## Keys
+
+| Key | Drawer closed | Drawer open |
+|-----|---------------|-------------|
+| Left / Right | tune by the underlined digit | change the selected setting |
+| Up / Down | move the tuning digit cursor | move the selection |
+| 0-9 `.` | direct frequency entry in MHz, Enter tunes | 1-7 jump to a tab |
+| Enter | - | toggle / run / edit text field |
+| Tab | open drawer | close drawer |
+| Esc or `` ` `` | cancel popup | close drawer |
+| D | cycle WFM / NFM / AM / SAM / USB / LSB / CW / RAW | same |
+| B / Shift+B | widen / narrow filter | same |
+| G / Shift+G | RF gain up / down | same |
+| S / Shift+S | squelch threshold up / down (first press arms it at the current level) | same |
+| A | auto-scale FFT and waterfall to the noise floor | same |
+| Z | zoom 1x / 2x / 4x centred on the VFO | same |
+| Space | mute / unmute | same |
+| P | play / stop | same |
+
+Drawer tabs: `1 SOURCE`, `2 RADIO`, `3 DSP/NR`, `7 DISPLAY`. Tabs 4-6 are reserved for bookmarks, scanner and rec/net.
+
+## Boot defaults (CM0-safe, all adjustable)
+
+1.024 MSPS, 1024-point FFT, 30 lines/s, 30 FPS frame cap, one VFO, WFM 200 kHz.
+RTL-SDR is tried first; if no dongle starts, the simulator runs and the reason is shown.
+
+## Audio and DAC protection
+
+Three layers keep the ES8389 away from 0 dB: `run_cardsdr.sh` sets the mixer to -6 dB with `amixer`,
+`cardsdr` clamps the card's main playback control itself, and the output stage hard-limits every sample to -6 dBFS
+regardless of volume (unit-tested).
 
 ## Diagnostics
 
-`--frames N --screenshot out.ppm` renders N frames, prints frame timing and saves the final frame; usable headless under `xvfb-run`.
+```bash
+./build/cardsdr --video none --source sim --frames 200 --screenshot out.bmp --keys "1,0,0,.,4,ENTER,d,TAB,2"
+```
+
+runs headless, injects keystrokes and saves the final frame.

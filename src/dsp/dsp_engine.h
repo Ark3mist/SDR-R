@@ -13,6 +13,8 @@
 #include "core/ring_buffer.h"
 #include "core/types.h"
 
+namespace osx { class Receiver; }
+
 namespace osx {
 
 // uint8 offset-binary I/Q -> complex float in [-1, 1].
@@ -42,7 +44,8 @@ struct DcBlocker {
 
 class DspEngine {
 public:
-    DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap);
+    // `rx` (optional) is the VFO receive chain driven from this thread.
+    DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap, Receiver* rx = nullptr);
     ~DspEngine();
 
     void start(double sampleRate);
@@ -61,6 +64,7 @@ private:
 
     RingBuffer<uint8_t>& in_;
     RingBuffer<cf32>& tap_;
+    Receiver* rx_ = nullptr;
     double sampleRate_ = 2.4e6;
     std::atomic<bool> running_{false};
     std::thread thread_;

@@ -1,6 +1,7 @@
 #include "source/sim_source.h"
 
-#include <array>
+#include "core/exp_table.h"
+
 #include <chrono>
 #include <algorithm>
 #include <cmath>
@@ -12,24 +13,6 @@ namespace osx {
 namespace {
 
 constexpr double kTwo32 = 4294967296.0;
-
-// 65536-entry complex exponential table; phase is a uint32 accumulator whose
-// top 16 bits index the table (spurs ~ -96 dBc, far below 8-bit quantisation).
-const std::array<std::complex<float>, 65536>& expTable() {
-    static const auto table = [] {
-        auto t = std::make_unique<std::array<std::complex<float>, 65536>>();
-        for (size_t i = 0; i < t->size(); ++i) {
-            const double a = 2.0 * std::numbers::pi * double(i) / double(t->size());
-            (*t)[i] = {float(std::cos(a)), float(std::sin(a))};
-        }
-        return t;
-    }();
-    return *table;
-}
-
-inline uint32_t phaseInc(double hz, double sr) {
-    return uint32_t(int64_t(std::llround(hz / sr * kTwo32)));
-}
 
 inline uint64_t xorshift(uint64_t& s) {
     s ^= s << 13;
@@ -68,6 +51,12 @@ SimSource::~SimSource() { stop(); }
 
 std::vector<double> SimSource::sampleRates() const {
     return {250e3, 1.024e6, 1.536e6, 1.792e6, 1.92e6, 2.048e6, 2.16e6, 2.4e6, 2.56e6, 2.88e6, 3.2e6};
+}
+
+std::vector<float> SimSource::gainSteps() const {
+    std::vector<float> g;
+    for (int db = -40; db <= 20; db += 2) g.push_back(float(db));
+    return g;
 }
 
 bool SimSource::start(RingBuffer<uint8_t>& out) {
@@ -109,12 +98,16 @@ void SimSource::generate(uint8_t* dst, size_t n) {
             const uint32_t toneInc = phaseInc(em.toneHz, sr);
             switch (em.mod) {
                 case Mod::WFM: {
+                    // Real stereo multiplex: L = tone, R = 3 x tone,
+                    // mpx = 0.9 (M + S sin 2wp t) + 0.1 sin wp t (19 kHz pilot).
                     const uint32_t pilotInc = phaseInc(19e3, sr);
                     const double k = double(em.devHz) / sr * kTwo32;
                     for (size_t i = 0; i < n; ++i) {
-                        const float m = 0.50f * tab[st.modPhase >> 16].imag() +
-                                        0.35f * tab[uint32_t(st.modPhase * 3u) >> 16].imag() +
-                                        0.10f * tab[st.pilotPhase >> 16].imag();
+                        const float l = tab[st.modPhase >> 16].imag();
+                        const float r = tab[uint32_t(st.modPhase * 3u) >> 16].imag();
+                        const float pilot = tab[st.pilotPhase >> 16].imag();
+                        const float sub = tab[uint32_t(st.pilotPhase * 2u) >> 16].imag();
+                        const float m = 0.9f * (0.5f * (l + r) + 0.5f * (l - r) * sub) + 0.1f * pilot;
                         st.modPhase += toneInc;
                         st.pilotPhase += pilotInc;
                         st.fmPhase += uint32_t(int32_t(k * m));
@@ -122,7 +115,19 @@ void SimSource::generate(uint8_t* dst, size_t n) {
                     }
                     break;
                 }
-                case Mod::NFM:
+                case Mod::NFM: {
+                    // Voice tone plus a 100.0 Hz CTCSS sub-tone at 15 % deviation.
+                    const uint32_t ctcssInc = phaseInc(kSimCtcssHz, sr);
+                    const double k = double(em.devHz) / sr * kTwo32;
+                    for (size_t i = 0; i < n; ++i) {
+                        const float m = 0.8f * tab[st.modPhase >> 16].imag() + 0.15f * tab[st.pilotPhase >> 16].imag();
+                        st.modPhase += toneInc;
+                        st.pilotPhase += ctcssInc;
+                        st.fmPhase += uint32_t(int32_t(k * m));
+                        env_[i] = tab[st.fmPhase >> 16];
+                    }
+                    break;
+                }
                 case Mod::Sweep: {
                     const double k = double(em.devHz) / sr * kTwo32;
                     for (size_t i = 0; i < n; ++i) {

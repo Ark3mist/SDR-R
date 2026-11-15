@@ -4,6 +4,8 @@
 #include <array>
 #include <cmath>
 
+#include "dsp/receiver.h"
+
 namespace osx {
 
 namespace {
@@ -26,8 +28,8 @@ void convertU8ToCf32(const uint8_t* src, cf32* dst, size_t nSamples, bool swapIq
     }
 }
 
-DspEngine::DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap)
-    : in_(in), tap_(spectrumTap) {
+DspEngine::DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap, Receiver* rx)
+    : in_(in), tap_(spectrumTap), rx_(rx) {
     u8Lut();
 }
 
@@ -36,6 +38,7 @@ DspEngine::~DspEngine() { stop(); }
 void DspEngine::start(double sampleRate) {
     if (running_.exchange(true)) return;
     sampleRate_ = sampleRate;
+    if (rx_) rx_->setInputRate(sampleRate);
     thread_ = std::thread(&DspEngine::run, this);
 }
 
@@ -75,6 +78,7 @@ void DspEngine::run() {
 
         // Spectrum tap is best-effort: if the display falls behind, drop.
         tap_.write(iq.data(), n);
+        if (rx_) rx_->process(iq.data(), n);
         samples_.fetch_add(n, std::memory_order_relaxed);
     }
 }
