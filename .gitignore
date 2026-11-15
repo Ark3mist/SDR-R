@@ -1,0 +1,7 @@
+build/
+build-*/
+imgui.ini
+*.ppm
+compile_commands.json
+.vscode/
+.idea/
