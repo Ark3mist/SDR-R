@@ -29,6 +29,14 @@ std::vector<std::string> RtlSdrSource::listDevices() {
     return out;
 }
 
+int RtlSdrSource::deviceCount() { return int(rtlsdr_get_device_count()); }
+
+uint32_t RtlSdrSource::usbBlockBytes(double sampleRate) {
+    const double bytes = sampleRate * 2.0 * 0.064;            // 64 ms of interleaved u8 I/Q
+    const uint32_t blocks = uint32_t(std::max(1.0, std::floor(bytes / 16384.0)));
+    return std::min<uint32_t>(262144, blocks * 16384);        // multiple of 16 KiB (USB-friendly)
+}
+
 std::vector<double> RtlSdrSource::sampleRates() const {
     return {250e3, 1.024e6, 1.536e6, 1.792e6, 1.92e6, 2.048e6, 2.16e6, 2.4e6, 2.56e6, 2.88e6, 3.2e6};
 }
@@ -39,8 +47,10 @@ void RtlSdrSource::callback(unsigned char* buf, uint32_t len, void* ctx) {
     if (w < len) self->overruns_.fetch_add(len - w, std::memory_order_relaxed);
 }
 
-bool RtlSdrSource::start(RingBuffer<uint8_t>& out) {
+bool RtlSdrSource::start(const SourceRings& rings) {
     if (running_.load()) return true;
+    if (!rings.u8) return false;
+    RingBuffer<uint8_t>& out = *rings.u8;
     std::lock_guard<std::mutex> lk(devMutex_);
     error_.clear();
     rtlsdr_dev_t* dev = nullptr;
@@ -74,9 +84,10 @@ bool RtlSdrSource::start(RingBuffer<uint8_t>& out) {
     rtlsdr_reset_buffer(dev);
 
     running_.store(true);
-    thread_ = std::thread([this, dev] {
+    const uint32_t blockBytes = usbBlockBytes(sampleRate_);
+    thread_ = std::thread([this, dev, blockBytes] {
         // Blocks until rtlsdr_cancel_async() or the device disappears.
-        rtlsdr_read_async(dev, &RtlSdrSource::callback, this, 0, 16384);
+        rtlsdr_read_async(dev, &RtlSdrSource::callback, this, 15, blockBytes);
         if (running_.exchange(false)) error_ = "RTL-SDR stream stopped (device unplugged?)";
     });
     return true;

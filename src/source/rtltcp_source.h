@@ -13,7 +13,8 @@ public:
     ~RtlTcpSource() override;
 
     const char* name() const override { return "rtl_tcp"; }
-    bool start(RingBuffer<uint8_t>& out) override;
+    using Source::start;
+    bool start(const SourceRings& out) override;
     void stop() override;
     bool running() const override { return running_.load(); }
 

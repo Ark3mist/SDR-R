@@ -14,9 +14,14 @@ enum class Key { None, Left, Right, Up, Down, Enter, Esc, Tab, Backspace, Space,
 
 struct KeyEvent {
     Key key = Key::None;
-    char ch = 0;        // Key::Char: lower-case letter, digit or punctuation
+    char ch = 0;        // Key::Char: unshifted key: lower-case letter, digit or punctuation
+    char text = 0;      // the character it types (shift applied, US layout); 0 if none
     bool shift = false;
+    bool ctrl = false;
 };
+
+// US-layout shift mapping: 'a' -> 'A', '1' -> '!', '=' -> '+', ...
+char shiftedChar(char c, bool shift);
 
 // SDL_KEYDOWN -> KeyEvent (key == None if the event is not a usable key).
 KeyEvent keyFromSdl(const SDL_Event& e);
@@ -36,7 +41,7 @@ public:
 
 private:
     std::vector<int> fds_;
-    bool shift_ = false;
+    bool shift_ = false, ctrl_ = false;
     std::string desc_;
 };
 

@@ -40,44 +40,112 @@ inline std::vector<float> designLowpass(double fs, double fc, size_t taps, FirWi
     return out;
 }
 
-// Streaming FIR with sample type S and tap type T. The delay line is written
-// twice so the convolution always runs over contiguous memory.
-template <typename S, typename T>
-class Fir {
-public:
-    void setTaps(std::vector<T> taps) {
-        if (taps.size() != taps_.size()) {
-            delay_.assign(taps.size() * 2, S{});
-            pos_ = 0;
-        }
-        taps_ = std::move(taps);
-    }
-    size_t size() const { return taps_.size(); }
-    void reset() { std::fill(delay_.begin(), delay_.end(), S{}); }
+// Streaming FIR filters on complex samples. Delay lines are stored as
+// separate I and Q float arrays (structure of arrays), each written twice so
+// the convolution always runs over contiguous memory. The inner loops are
+// plain float dot products, which GCC/Clang vectorise to NEON (aarch64) or
+// SSE/AVX (x86) under -O3 -ffast-math. All storage is sized in setTaps();
+// push()/compute() never allocate.
 
-    void push(S x) {
-        const size_t n = taps_.size();
-        pos_ = (pos_ == 0) ? n - 1 : pos_ - 1;
-        delay_[pos_] = x;
-        delay_[pos_ + n] = x;
+// Complex samples, real taps.
+class FirCR {
+public:
+    void setTaps(const std::vector<float>& taps) {
+        n_ = taps.size();
+        h_.assign(taps.rbegin(), taps.rend());  // reversed: oldest sample meets h_[0]
+        re_.assign(2 * n_, 0.0f);
+        im_.assign(2 * n_, 0.0f);
+        pos_ = 0;
     }
-    S compute() const {
-        const size_t n = taps_.size();
-        const S* d = &delay_[pos_];
-        const T* h = taps_.data();
-        S acc{};
-        for (size_t k = 0; k < n; ++k) acc += d[k] * h[k];
-        return acc;
+    size_t size() const { return n_; }
+    void reset() {
+        std::fill(re_.begin(), re_.end(), 0.0f);
+        std::fill(im_.begin(), im_.end(), 0.0f);
     }
-    S filter(S x) {
+    void push(std::complex<float> x) {
+        re_[pos_] = re_[pos_ + n_] = x.real();
+        im_[pos_] = im_[pos_ + n_] = x.imag();
+        pos_ = (pos_ + 1 == n_) ? 0 : pos_ + 1;
+    }
+    std::complex<float> compute() const {
+        const float* r = &re_[pos_];
+        const float* q = &im_[pos_];
+        const float* h = h_.data();
+        float ar = 0.0f, aq = 0.0f;
+        for (size_t k = 0; k < n_; ++k) {
+            ar += r[k] * h[k];
+            aq += q[k] * h[k];
+        }
+        return {ar, aq};
+    }
+    std::complex<float> filter(std::complex<float> x) {
         push(x);
         return compute();
     }
 
 private:
-    std::vector<T> taps_;
-    std::vector<S> delay_;
-    size_t pos_ = 0;
+    size_t n_ = 0, pos_ = 0;
+    std::vector<float> h_, re_, im_;
+};
+
+// Complex samples, complex taps (shifted band-pass, e.g. SSB).
+class FirCC {
+public:
+    void setTaps(const std::vector<std::complex<float>>& taps) {
+        n_ = taps.size();
+        hr_.resize(n_);
+        hi_.resize(n_);
+        for (size_t k = 0; k < n_; ++k) {
+            hr_[k] = taps[n_ - 1 - k].real();
+            hi_[k] = taps[n_ - 1 - k].imag();
+        }
+        re_.assign(2 * n_, 0.0f);
+        im_.assign(2 * n_, 0.0f);
+        pos_ = 0;
+    }
+    size_t size() const { return n_; }
+    std::complex<float> filter(std::complex<float> x) {
+        re_[pos_] = re_[pos_ + n_] = x.real();
+        im_[pos_] = im_[pos_ + n_] = x.imag();
+        pos_ = (pos_ + 1 == n_) ? 0 : pos_ + 1;
+        const float* r = &re_[pos_];
+        const float* q = &im_[pos_];
+        float rr = 0.0f, qi = 0.0f, ri = 0.0f, qr = 0.0f;
+        for (size_t k = 0; k < n_; ++k) {
+            rr += r[k] * hr_[k];
+            qi += q[k] * hi_[k];
+            ri += r[k] * hi_[k];
+            qr += q[k] * hr_[k];
+        }
+        return {rr - qi, ri + qr};
+    }
+
+private:
+    size_t n_ = 0, pos_ = 0;
+    std::vector<float> hr_, hi_, re_, im_;
+};
+
+// Real samples, real taps.
+class FirRR {
+public:
+    void setTaps(const std::vector<float>& taps) {
+        n_ = taps.size();
+        h_.assign(taps.rbegin(), taps.rend());
+        d_.assign(2 * n_, 0.0f);
+        pos_ = 0;
+    }
+    float filter(float x) {
+        d_[pos_] = d_[pos_ + n_] = x;
+        pos_ = (pos_ + 1 == n_) ? 0 : pos_ + 1;
+        const float* d = &d_[pos_];
+        float acc = 0.0f;
+        for (size_t k = 0; k < n_; ++k) acc += d[k] * h_[k];
+        return acc;
+    }
+
+private:
+    size_t n_ = 0, pos_ = 0;
+    std::vector<float> h_, d_;
 };
 
 // RBJ biquad (direct form I, float).

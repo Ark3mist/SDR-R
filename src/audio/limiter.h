@@ -21,12 +21,12 @@ struct OutputLimiter {
     explicit OutputLimiter(double sampleRate = 48000.0, double releaseSeconds = 0.15)
         : release(float(1.0 - std::exp(-1.0 / (releaseSeconds * sampleRate)))) {}
 
-    // volume01: 0..1 (square-law taper). Processes interleaved stereo in place.
-    void process(float* x, size_t frames, float volume01, bool mute) {
-        const float vol = mute ? 0.0f : volume01 * volume01;
+    // Processes interleaved stereo in place: x = clamp(x * g), where the
+    // instant-attack / smooth-release gain g keeps every sample <= kCeiling.
+    void process(float* x, size_t frames) {
         float pk = 0.0f;
         for (size_t i = 0; i < frames; ++i) {
-            float l = x[2 * i] * vol, r = x[2 * i + 1] * vol;
+            float l = x[2 * i], r = x[2 * i + 1];
             const float a = std::max(std::fabs(l), std::fabs(r));
             const float need = a > kCeiling ? kCeiling / a : 1.0f;
             if (need < gain) gain = need;                 // instant attack
@@ -38,6 +38,12 @@ struct OutputLimiter {
             pk = std::max({pk, std::fabs(l), std::fabs(r)});
         }
         peak = pk;
+    }
+    // Legacy helper: square-law volume + mute, then limit.
+    void process(float* x, size_t frames, float volume01, bool mute) {
+        const float vol = mute ? 0.0f : volume01 * volume01;
+        for (size_t i = 0; i < 2 * frames; ++i) x[i] *= vol;
+        process(x, frames);
     }
 };
 

@@ -31,6 +31,7 @@ public:
                 const size_t idx = p + k * kPhases;
                 bank_[p * taps_ + (taps_ - 1 - k)] = (idx < total ? proto[idx] : 0.0f) * float(kPhases);
             }
+        buf_.reserve(taps_ + 262144);  // process() appends at most one chunk: never reallocates
         buf_.assign(taps_ - 1, 0.0f);
         tpos_ = double(taps_ - 1);
     }

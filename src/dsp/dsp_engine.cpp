@@ -28,16 +28,17 @@ void convertU8ToCf32(const uint8_t* src, cf32* dst, size_t nSamples, bool swapIq
     }
 }
 
-DspEngine::DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap, Receiver* rx)
-    : in_(in), tap_(spectrumTap), rx_(rx) {
+DspEngine::DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap, Receiver* rx, RingBuffer<cf32>* inF32)
+    : in_(in), inF32_(inF32), tap_(spectrumTap), rx_(rx) {
     u8Lut();
 }
 
 DspEngine::~DspEngine() { stop(); }
 
-void DspEngine::start(double sampleRate) {
+void DspEngine::start(double sampleRate, Input input) {
     if (running_.exchange(true)) return;
     sampleRate_ = sampleRate;
+    input_ = (input == Input::CF32 && inF32_) ? Input::CF32 : Input::U8;
     if (rx_) rx_->setInputRate(sampleRate);
     thread_ = std::thread(&DspEngine::run, this);
 }
@@ -45,6 +46,7 @@ void DspEngine::start(double sampleRate) {
 void DspEngine::stop() {
     if (!running_.exchange(false)) return;
     in_.wake();
+    if (inF32_) inF32_->wake();
     if (thread_.joinable()) thread_.join();
 }
 
@@ -53,18 +55,27 @@ void DspEngine::run() {
     std::vector<uint8_t> raw(kMaxBlock * 2);
     std::vector<cf32> iq(kMaxBlock);
     DcBlocker dcBlock;
-    dcBlock.setTimeConstant(0.05, sampleRate_);
+    IqBalance iqBal;
     float peak = 0.0f;
+    const bool f32 = (input_ == Input::CF32);
 
     while (running_.load(std::memory_order_relaxed)) {
-        size_t avail = in_.waitReadable(2);
-        if (!running_.load(std::memory_order_relaxed)) break;
-        avail &= ~size_t(1);  // whole I/Q pairs only
-        if (avail == 0) continue;
-        const size_t got = in_.read(raw.data(), std::min(avail, raw.size()));
-        const size_t n = got / 2;
-
-        convertU8ToCf32(raw.data(), iq.data(), n, invertIq.load(std::memory_order_relaxed));
+        size_t n = 0;
+        if (f32) {
+            inF32_->waitReadable(1);
+            if (!running_.load(std::memory_order_relaxed)) break;
+            n = inF32_->read(iq.data(), kMaxBlock);
+            if (n == 0) continue;
+            if (invertIq.load(std::memory_order_relaxed))
+                for (size_t i = 0; i < n; ++i) iq[i] = {iq[i].imag(), iq[i].real()};
+        } else {
+            size_t avail = in_.waitReadable(2);
+            if (!running_.load(std::memory_order_relaxed)) break;
+            avail &= ~size_t(1);  // whole I/Q pairs only
+            if (avail == 0) continue;
+            n = in_.read(raw.data(), std::min(avail, raw.size())) / 2;
+            convertU8ToCf32(raw.data(), iq.data(), n, invertIq.load(std::memory_order_relaxed));
+        }
 
         // ADC peak before any correction (what the tuner actually delivered).
         float blockPeak = 0.0f;
@@ -75,6 +86,13 @@ void DspEngine::run() {
 
         if (dcRemoval.load(std::memory_order_relaxed)) dcBlock.process(iq.data(), n);
         else dcBlock.reset();
+        if (iqCorrection.load(std::memory_order_relaxed)) {
+            iqBal.process(iq.data(), n, sampleRate_);
+            iqPhaseErrDeg.store(iqBal.phaseErrorDeg(), std::memory_order_relaxed);
+            iqGainErrDb.store(iqBal.gainErrorDb(), std::memory_order_relaxed);
+        } else {
+            iqBal.reset();
+        }
 
         // Spectrum tap is best-effort: if the display falls behind, drop.
         tap_.write(iq.data(), n);

@@ -1,8 +1,9 @@
 // Thread 2: the DSP engine.
 //
-// Pulls raw uint8 I/Q from the hardware ring, converts to complex float,
-// applies IQ inversion and DC-spike removal, and feeds the spectrum tap.
-// (The per-VFO DDC / demodulator chain hangs off this thread from Phase 2.)
+// Pulls I/Q from the source ring (raw uint8 from RTL-SDR / rtl_tcp / the
+// simulator, or complex float from the file player), converts to complex
+// float, applies IQ inversion, DC-spike removal and I/Q balance correction,
+// feeds the display-FFT tap, and runs the VFO receive chain.
 #pragma once
 
 #include <atomic>
@@ -12,6 +13,7 @@
 
 #include "core/ring_buffer.h"
 #include "core/types.h"
+#include "dsp/conditioning.h"
 
 namespace osx { class Receiver; }
 
@@ -20,40 +22,24 @@ namespace osx {
 // uint8 offset-binary I/Q -> complex float in [-1, 1].
 void convertU8ToCf32(const uint8_t* src, cf32* dst, size_t nSamples, bool swapIq);
 
-// Single-pole DC tracker: y[n] = x[n] - dc[n], dc += alpha * (x - dc).
-struct DcBlocker {
-    cf32 dc{0.0f, 0.0f};
-    float alpha = 1e-5f;
-
-    void setTimeConstant(double seconds, double sampleRate) {
-        alpha = float(1.0 / (seconds * sampleRate));
-    }
-    void reset() { dc = {0.0f, 0.0f}; }
-    void process(cf32* x, size_t n) {
-        float dr = dc.real(), di = dc.imag();
-        const float a = alpha;
-        for (size_t i = 0; i < n; ++i) {
-            const float r = x[i].real(), q = x[i].imag();
-            dr += a * (r - dr);
-            di += a * (q - di);
-            x[i] = {r - dr, q - di};
-        }
-        dc = {dr, di};
-    }
-};
-
 class DspEngine {
 public:
     // `rx` (optional) is the VFO receive chain driven from this thread.
-    DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap, Receiver* rx = nullptr);
+    enum class Input { U8, CF32 };
+    DspEngine(RingBuffer<uint8_t>& in, RingBuffer<cf32>& spectrumTap, Receiver* rx = nullptr,
+              RingBuffer<cf32>* inF32 = nullptr);
     ~DspEngine();
 
-    void start(double sampleRate);
+    void start(double sampleRate, Input input = Input::U8);
     void stop();
     bool running() const { return running_.load(); }
 
     std::atomic<bool> dcRemoval{true};
     std::atomic<bool> invertIq{false};
+    std::atomic<bool> iqCorrection{true};
+
+    // Estimated front-end I/Q error (valid while iqCorrection is on).
+    std::atomic<float> iqPhaseErrDeg{0.0f}, iqGainErrDb{0.0f};
 
     uint64_t samplesProcessed() const { return samples_.load(std::memory_order_relaxed); }
     // Peak |I| or |Q| over the most recent blocks, 0..1 (ADC clip indicator).
@@ -63,6 +49,8 @@ private:
     void run();
 
     RingBuffer<uint8_t>& in_;
+    RingBuffer<cf32>* inF32_ = nullptr;
+    Input input_ = Input::U8;
     RingBuffer<cf32>& tap_;
     Receiver* rx_ = nullptr;
     double sampleRate_ = 2.4e6;

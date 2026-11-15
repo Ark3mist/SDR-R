@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <string>
 
 #include "core/exp_table.h"
 
@@ -18,22 +19,65 @@ inline uint32_t turnsToPhase(float turns) { return uint32_t(int64_t(turns * kTwo
 }  // namespace
 
 const char* demodName(Demod m) {
-    static const char* names[] = {"WFM", "NFM", "AM", "SAM", "USB", "LSB", "CW", "RAW"};
+    static const char* names[] = {"WFM", "NFM", "AM", "SAM", "USB", "LSB", "DSB", "CW", "RAW"};
     return int(m) < int(Demod::Count) ? names[int(m)] : "?";
+}
+
+bool demodFromName(const std::string& name, Demod& out) {
+    for (int i = 0; i < int(Demod::Count); ++i)
+        if (name == demodName(Demod(i))) {
+            out = Demod(i);
+            return true;
+        }
+    return false;
 }
 
 const DemodLimits& demodLimits(Demod m) {
     static const DemodLimits table[] = {
-        /* WFM */ {50e3, 250e3, 200e3, 10e3, 100e3},
+        /* WFM */ {50e3, 200e3, 200e3, 10e3, 100e3},
         /* NFM */ {4e3, 25e3, 12.5e3, 500.0, 12.5e3},
         /* AM  */ {2.5e3, 15e3, 10e3, 500.0, 1e3},
         /* SAM */ {2.5e3, 15e3, 10e3, 500.0, 1e3},
-        /* USB */ {500.0, 6e3, 2.8e3, 100.0, 100.0},
-        /* LSB */ {500.0, 6e3, 2.8e3, 100.0, 100.0},
+        /* USB */ {1.8e3, 4e3, 2.8e3, 100.0, 100.0},
+        /* LSB */ {1.8e3, 4e3, 2.8e3, 100.0, 100.0},
+        /* DSB */ {2e3, 10e3, 5e3, 500.0, 100.0},
         /* CW  */ {100.0, 1000.0, 500.0, 50.0, 10.0},
         /* RAW */ {1e3, 48e3, 48e3, 1e3, 1e3},
     };
     return table[std::min(int(m), int(Demod::Count) - 1)];
+}
+
+void passband(const RxConfig& c, double& lo, double& hi) {
+    const double bw = c.bandwidthHz, cut = std::min(c.lowCutHz, bw - 100.0);
+    switch (c.mode) {
+        case Demod::USB: lo = cut; hi = bw; break;
+        case Demod::LSB: lo = -bw; hi = -cut; break;
+        default: lo = -bw * 0.5; hi = bw * 0.5; break;
+    }
+}
+
+NrPreset nrPreset(const RxConfig& c) {
+    if (!c.nb && !c.anf && !c.nr) return NrPreset::Off;
+    if (c.nb && !c.anf && !c.nr) return NrPreset::NB;
+    if (c.nb && c.anf && !c.nr) return NrPreset::NBNotch;
+    if (c.nb && c.anf && c.nr) return NrPreset::Full;
+    return NrPreset::Custom;
+}
+
+void applyNrPreset(RxConfig& c, NrPreset p) {
+    c.nb = (p != NrPreset::Off);
+    c.anf = (p == NrPreset::NBNotch || p == NrPreset::Full);
+    c.nr = (p == NrPreset::Full);
+}
+
+const char* nrPresetName(NrPreset p) {
+    switch (p) {
+        case NrPreset::Off: return "Off";
+        case NrPreset::NB: return "NB";
+        case NrPreset::NBNotch: return "NB+Notch";
+        case NrPreset::Full: return "Full NR";
+        default: return "Custom";
+    }
 }
 
 const std::vector<float>& ctcssTones() {
@@ -46,7 +90,19 @@ const std::vector<float>& ctcssTones() {
     return tones;
 }
 
-Receiver::Receiver(RingBuffer<float>& audioOut) : audio_(audioOut) { expTable(); }
+Receiver::Receiver(RingBuffer<float>& audioOut) : audio_(audioOut) {
+    expTable();
+    // Worst-case sizes, so nothing in process() ever grows a vector.
+    nbBuf_.reserve(kMaxBlock);
+    if_.reserve(kMaxBlock);
+    l_.reserve(kMaxBlock);
+    r_.reserve(kMaxBlock);
+    mpx_.reserve(kMaxBlock);
+    la_.reserve(4 * kMaxBlock);
+    ra_.reserve(4 * kMaxBlock);
+    out_.reserve(8 * kMaxBlock);
+    ctcssBuf_.reserve(8192);
+}
 
 void Receiver::setInputRate(double fs) {
     inRate_ = fs;
@@ -65,15 +121,26 @@ RxConfig Receiver::config() const {
 }
 
 void Receiver::rebuild() {
+    RxConfig next;
     {
         std::lock_guard<std::mutex> lk(cfgMutex_);
-        cfg_ = pending_;
+        next = pending_;
         dirty_.store(false);
     }
+    const bool structural = !built_ || next.mode != cfg_.mode || next.bandwidthHz != cfg_.bandwidthHz ||
+                            next.lowCutHz != cfg_.lowCutHz || next.cwPitchHz != cfg_.cwPitchHz;
+    cfg_ = next;
+    if (!structural) {  // squelch, AGC, NB/ANF/NR, de-emphasis...: no filter reset, no glitch
+        applyLive();
+        return;
+    }
+    built_ = true;
     const Demod m = cfg_.mode;
     const DemodLimits& lim = demodLimits(m);
     const double bw = std::clamp(cfg_.bandwidthHz, lim.minBw, lim.maxBw);
     const bool ssb = (m == Demod::USB || m == Demod::LSB);
+    double pbLo = 0.0, pbHi = 0.0;
+    passband(cfg_, pbLo, pbHi);
 
     // ---- stage 1: integer decimation to the IF rate -------------------------
     double modeMin = 16e3;
@@ -81,11 +148,12 @@ void Receiver::rebuild() {
         case Demod::WFM: modeMin = 200e3; break;
         case Demod::NFM: modeMin = 24e3; break;
         case Demod::USB: case Demod::LSB: modeMin = 12e3; break;
+        case Demod::DSB: modeMin = 16e3; break;
         case Demod::CW: modeMin = 8e3; break;
         case Demod::RAW: modeMin = 48e3; break;
         default: break;
     }
-    const double occupied = ssb ? 2.0 * bw : bw;
+    const double occupied = 2.0 * std::max(std::fabs(pbLo), std::fabs(pbHi));
     const double need = std::max(modeMin, 1.4 * occupied);
     decim_ = std::clamp<size_t>(size_t(inRate_ / need), 1, 256);
     ifRate_ = inRate_ / double(decim_);
@@ -93,18 +161,18 @@ void Receiver::rebuild() {
     if (decim_ > 1)  // pass to 0.36 fs_if, stop from 0.64 fs_if
         stage1_.setTaps(designLowpass(inRate_, 0.5 * ifRate_, 12 * decim_ + 1, FirWindow::Hamming));
 
-    // ---- channel filter (complex band-pass at the IF rate) ------------------
+    // ---- stage 2: channel filter (complex band-pass at the IF rate) --------
     const FirWindow win = (m == Demod::WFM) ? FirWindow::Hamming : FirWindow::Blackman;
-    const double tw = std::max(bw * 0.2, 25.0);
+    const double width = pbHi - pbLo, shift = 0.5 * (pbLo + pbHi);
+    const double tw = ssb ? 200.0 : std::max(width * 0.2, 25.0);
     const size_t nTaps = firTapsFor(ifRate_, tw, win, 1025);
-    const std::vector<float> proto = designLowpass(ifRate_, bw * 0.5, nTaps, win);
-    const double shift = (m == Demod::USB) ? bw * 0.5 : (m == Demod::LSB ? -bw * 0.5 : 0.0);
+    const std::vector<float> proto = designLowpass(ifRate_, width * 0.5, nTaps, win);
     std::vector<cf32> taps(nTaps);
     for (size_t k = 0; k < nTaps; ++k) {
         const double a = 2.0 * std::numbers::pi * shift * (double(k) - double(nTaps - 1) / 2.0) / ifRate_;
         taps[k] = cf32(float(std::cos(a)), float(std::sin(a))) * proto[k];
     }
-    channel_.setTaps(std::move(taps));
+    channel_.setTaps(taps);
 
     // ---- audio resampler ------------------------------------------------------
     double pass = 5e3, stop = 7e3;
@@ -113,6 +181,7 @@ void Receiver::rebuild() {
         case Demod::NFM: pass = std::min(bw * 0.5, 5e3); stop = pass * 1.4; break;
         case Demod::AM: case Demod::SAM: pass = bw * 0.5; stop = pass * 1.3; break;
         case Demod::USB: case Demod::LSB: pass = bw; stop = pass * 1.25; break;
+        case Demod::DSB: pass = bw * 0.5; stop = pass * 1.3; break;
         case Demod::CW: pass = double(cfg_.cwPitchHz) + bw * 0.5 + 100.0; stop = pass * 1.5; break;
         case Demod::RAW: pass = bw * 0.5; stop = pass * 1.2; break;
         default: break;
@@ -123,6 +192,11 @@ void Receiver::rebuild() {
     resR_.design(ifRate_, kAudioRate, pass, stop);
 
     // ---- demodulator state ----------------------------------------------------
+    nb_.configure(inRate_);
+    nb_.reset();
+    rds_.configure(ifRate_);
+    lastOffset_ = offsetHz_.load();
+
     const double dev = (m == Demod::WFM) ? 75e3 : bw * 0.5;
     fmScale_ = float(ifRate_ / (2.0 * std::numbers::pi * dev));
     fmPrev_ = {1.0f, 0.0f};
@@ -147,19 +221,10 @@ void Receiver::rebuild() {
     bfoPhase_ = 0;
     bfoInc_ = phaseInc(cfg_.cwPitchHz, ifRate_);
 
-    // ---- audio-rate post-processing ---------------------------------------------
-    const bool fm = (m == Demod::WFM || m == Demod::NFM);
-    const double tau = cfg_.deemphasis == 1 ? 50e-6 : 75e-6;
-    deCoef_ = (fm && cfg_.deemphasis != 0) ? float(1.0 - std::exp(-1.0 / (tau * kAudioRate))) : 1.0f;
-    deL_ = deR_ = 0.0f;
-    dcAvg_ = 0.0f;
-    static const double decayS[] = {0.1, 0.5, 2.0}, hangS[] = {0.05, 0.25, 1.0};
-    const int a = std::clamp(cfg_.agc, 0, 2);
-    agcDecay_ = float(std::exp(-1.0 / (decayS[a] * kAudioRate)));
-    agcAttack_ = float(1.0 - std::exp(-1.0 / (0.002 * kAudioRate)));
-    agcHangSamples_ = int(hangS[a] * kAudioRate);
     agcEnv_ = 1e-3f;
     agcHang_ = 0;
+    deL_ = deR_ = 0.0f;
+    dcAvg_ = 0.0f;
     nfmHp_.highpass(kAudioRate, 300.0);
     nfmHp_.reset();
     ctcssLp_.lowpass(kAudioRate, 300.0);
@@ -170,14 +235,63 @@ void Receiver::rebuild() {
     ctcssLast_ = -1;
     ctcssMiss_ = 0;
     ctcssHz.store(0.0f);
+    anf_.reset();
+    nr_.reset();
+    applyLive();
+}
+
+void Receiver::applyLive() {
+    const Demod m = cfg_.mode;
+    const bool fm = (m == Demod::WFM || m == Demod::NFM);
+    const double tau = cfg_.deemphasis == 1 ? 50e-6 : 75e-6;
+    deCoef_ = (fm && cfg_.deemphasis != 0) ? float(1.0 - std::exp(-1.0 / (tau * kAudioRate))) : 1.0f;
+    static const double decayS[] = {0.1, 0.5, 2.0}, hangS[] = {0.05, 0.25, 1.0};
+    const int a = std::clamp(cfg_.agc, 0, 2);
+    agcDecay_ = float(std::exp(-1.0 / (decayS[a] * kAudioRate)));
+    agcAttack_ = float(1.0 - std::exp(-1.0 / (0.002 * kAudioRate)));
+    agcHangSamples_ = int(hangS[a] * kAudioRate);
+    nb_.threshold = std::clamp(cfg_.nbThreshold, 1.5f, 8.0f);
+    nb_.holdoffS = std::clamp(cfg_.nbHoldoffUs, 1.0f, 200.0f) * 1e-6f;
+    nr_.strength = std::clamp(cfg_.nrStrength, 0.0f, 1.0f);
+    if (!cfg_.anf) anf_.reset();
+    if (!cfg_.nr) nr_.reset();
+    if (m != Demod::NFM || !cfg_.ctcss) ctcssHz.store(0.0f);
 }
 
 void Receiver::process(const cf32* in, size_t n) {
     if (dirty_.load(std::memory_order_acquire)) rebuild();
+    while (n > 0) {
+        const size_t c = std::min(n, kMaxBlock);
+        processChunk(in, c);
+        in += c;
+        n -= c;
+    }
+}
+
+void Receiver::processChunk(const cf32* in, size_t n) {
     const auto& tab = expTable();
+    const double offset = offsetHz_.load(std::memory_order_relaxed);
+    if (std::fabs(offset - lastOffset_) > 1e3) {  // retuned: drop stale RDS / CTCSS state
+        rds_.reset();
+        ctcssHz.store(0.0f, std::memory_order_relaxed);
+        lastOffset_ = offset;
+    }
+
+    // ---- impulse noise blanker (wideband, before any filter) ----------------
+    if (cfg_.nb) {
+        nbBuf_.assign(in, in + n);
+        nb_.process(nbBuf_.data(), n);
+        in = nbBuf_.data();
+        if (nb_.total > uint64_t(inRate_ / 4)) {
+            nbBlankedPct.store(100.0f * float(nb_.blanked) / float(nb_.total), std::memory_order_relaxed);
+            nb_.blanked = nb_.total = 0;
+        }
+    } else {
+        nbBlankedPct.store(0.0f, std::memory_order_relaxed);
+    }
 
     // ---- mix to baseband and decimate ---------------------------------------
-    const uint32_t inc = phaseInc(-offsetHz_.load(std::memory_order_relaxed), inRate_);
+    const uint32_t inc = phaseInc(-offset, inRate_);
     uint32_t ph = ncoPhase_;
     if_.clear();
     if (decim_ == 1) {
@@ -242,6 +356,7 @@ void Receiver::demodulate(size_t n) {
             // regenerated 38 kHz carrier demodulates L-R synchronously.
             const bool wantStereo = cfg_.stereo;
             if (wantStereo) r_.resize(n);
+            mpx_.resize(n);
             const float lockCoef = float(1.0 - std::exp(-2.0 * std::numbers::pi * 3.0 / ifRate_));
             const float fMin = pilotNominal_ - float(60.0 / ifRate_), fMax = pilotNominal_ + float(60.0 / ifRate_);
             bool locked = stereoLocked.load(std::memory_order_relaxed);
@@ -249,6 +364,7 @@ void Receiver::demodulate(size_t n) {
                 const cf32 d = if_[i] * std::conj(fmPrev_);
                 fmPrev_ = if_[i];
                 const float mpx = std::atan2(d.imag(), d.real()) * fmScale_;
+                mpx_[i] = mpx;
                 if (!wantStereo) {
                     l_[i] = mpx;
                     continue;
@@ -274,6 +390,7 @@ void Receiver::demodulate(size_t n) {
             if (wantStereo) locked = locked ? pilotMag_ > 0.012f : pilotMag_ > 0.02f;
             else locked = false;
             stereoLocked.store(locked, std::memory_order_relaxed);
+            if (cfg_.rds) rds_.process(mpx_.data(), n);
             break;
         }
         case Demod::NFM:
@@ -299,6 +416,7 @@ void Receiver::demodulate(size_t n) {
             break;
         case Demod::USB:
         case Demod::LSB:
+        case Demod::DSB:  // product detector at the VFO frequency
             for (size_t i = 0; i < n; ++i) l_[i] = if_[i].real();
             break;
         case Demod::CW:
@@ -400,8 +518,19 @@ void Receiver::postProcess() {
                 ra_[i] = deR_;
             }
     }
-    const bool agc = (m == Demod::AM || m == Demod::SAM || m == Demod::USB || m == Demod::LSB || m == Demod::CW);
-    if (agc) {
+    // Interference removal on voice audio. The auto-notch is kept off CW (it
+    // would remove the wanted tone) and WFM / RAW (music, IQ data).
+    const bool voice = (m == Demod::NFM || m == Demod::AM || m == Demod::SAM || m == Demod::USB || m == Demod::LSB ||
+                        m == Demod::DSB);
+    if (cfg_.anf && voice) anf_.process(la_.data(), n);
+    if (cfg_.nr && (voice || m == Demod::CW)) nr_.process(la_.data(), n);
+
+    const bool agcMode = (m == Demod::AM || m == Demod::SAM || m == Demod::USB || m == Demod::LSB || m == Demod::DSB ||
+                          m == Demod::CW);
+    if (agcMode && cfg_.agc == 3) {
+        const float g = std::pow(10.0f, cfg_.afGainDb / 20.0f);
+        for (size_t i = 0; i < n; ++i) la_[i] *= g;
+    } else if (agcMode) {
         constexpr float target = 0.25f, maxGain = 1e4f;
         for (size_t i = 0; i < n; ++i) {
             const float a = std::fabs(la_[i]);

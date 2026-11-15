@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(OpenSDR-X VERSION 0.2.0 LANGUAGES C CXX)
+project(OpenSDR-X VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,19 +25,48 @@ if(OPENSDRX_FRONTEND MATCHES "^(desktop|both)$")
     set(BUILD_DESKTOP ON)
 endif()
 
-# Cardputer Zero = Raspberry Pi CM0 (Cortex-A53, aarch64).
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+# Cardputer Zero = Raspberry Pi CM0 (Cortex-A53, aarch64): NEON for the DSP.
+# Apple Silicon (simulator builds) gets plain -O3; Clang already targets its NEON.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64" AND NOT APPLE)
     set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=armv8-a+simd -mtune=cortex-a53")
     set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG -march=armv8-a+simd -mtune=cortex-a53")
+else()
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 endif()
+
+# Audio back end: ALSA on Linux (Cardputer), SDL2 on macOS.
+if(APPLE)
+    set(_audio_default sdl)
+else()
+    set(_audio_default alsa)
+endif()
+set(OPENSDRX_AUDIO "${_audio_default}" CACHE STRING "Audio back end: alsa or sdl")
+set_property(CACHE OPENSDRX_AUDIO PROPERTY STRINGS alsa sdl)
 
 include(FetchContent)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(FFTW3F REQUIRED IMPORTED_TARGET fftw3f)
-pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
 pkg_check_modules(RTLSDR REQUIRED IMPORTED_TARGET librtlsdr)
+if(OPENSDRX_AUDIO STREQUAL "alsa")
+    pkg_check_modules(ALSA REQUIRED IMPORTED_TARGET alsa)
+    set(OSX_AUDIO_SRC src/audio/audio_sink_alsa.cpp)
+    set(OSX_AUDIO_LIB PkgConfig::ALSA)
+else()
+    pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2>=2.0.18)
+    set(OSX_AUDIO_SRC src/audio/audio_sink_sdl.cpp)
+    set(OSX_AUDIO_LIB PkgConfig::SDL2)
+endif()
+
+# JSON for bookmarks: system package (nlohmann-json3-dev) or fetched, header-only.
+find_package(nlohmann_json 3.10 QUIET)
+if(NOT nlohmann_json_FOUND)
+    FetchContent_Declare(nlohmann_json
+        URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
 
 # ---- Dear ImGui (docking branch, pinned tag) -----------------------------------
 FetchContent_Declare(imgui
@@ -54,17 +83,22 @@ target_include_directories(imgui_core PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_
 
 # ---- Engine (no GUI dependency): rings, DSP, sources, audio --------------------
 add_library(osx_core STATIC
-    src/audio/alsa_sink.cpp
+    src/audio/audio_sink.cpp
+    ${OSX_AUDIO_SRC}
     src/dsp/dsp_engine.cpp
     src/dsp/receiver.cpp
+    src/dsp/rds.cpp
+    src/dsp/spectral_nr.cpp
     src/dsp/spectrum_analyzer.cpp
     src/dsp/spectrum_data.cpp
+    src/engine/bookmarks.cpp
     src/engine/radio.cpp
+    src/source/file_source.cpp
     src/source/rtlsdr_source.cpp
     src/source/rtltcp_source.cpp
     src/source/sim_source.cpp)
 target_include_directories(osx_core PUBLIC src)
-target_link_libraries(osx_core PUBLIC PkgConfig::FFTW3F PkgConfig::ALSA PkgConfig::RTLSDR Threads::Threads)
+target_link_libraries(osx_core PUBLIC PkgConfig::FFTW3F ${OSX_AUDIO_LIB} PkgConfig::RTLSDR nlohmann_json::nlohmann_json Threads::Threads)
 # The DSP inner loops are plain float dot products; let the compiler
 # reassociate them so they vectorise (NEON / SSE). No code relies on NaN/Inf.
 target_compile_options(osx_core PRIVATE -Wall -Wextra -Wpedantic -ffast-math)
@@ -74,7 +108,9 @@ set(OSX_UI_COMMON src/gui/theme.cpp src/gui/colormaps.cpp)
 
 # ---- Cardputer Zero front end ---------------------------------------------------
 if(BUILD_CARDPUTER)
-    pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2>=2.0.18)
+    if(NOT TARGET PkgConfig::SDL2)
+        pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2>=2.0.18)
+    endif()
     add_executable(cardsdr
         src/cardputer/main.cpp
         src/cardputer/ui.cpp
@@ -129,4 +165,11 @@ if(OPENSDRX_BUILD_TESTS)
     add_executable(osx_tests tests/test_core.cpp)
     target_link_libraries(osx_tests PRIVATE osx_core)
     add_test(NAME core COMMAND osx_tests)
+    if(BUILD_CARDPUTER)
+        add_executable(cardui_tests tests/test_ui.cpp src/cardputer/ui.cpp src/cardputer/input.cpp ${OSX_UI_COMMON})
+        target_include_directories(cardui_tests PRIVATE src)
+        target_link_libraries(cardui_tests PRIVATE osx_core imgui_core PkgConfig::SDL2)
+        target_compile_options(cardui_tests PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME cardui COMMAND cardui_tests)
+    endif()
 endif()

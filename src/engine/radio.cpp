@@ -1,6 +1,7 @@
 #include "engine/radio.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 namespace osx {
@@ -10,6 +11,7 @@ const char* Radio::sourceKindName(SourceKind k) {
         case SourceKind::Simulated: return "Simulated";
         case SourceKind::RtlSdr: return "RTL-SDR";
         case SourceKind::RtlTcp: return "rtl_tcp";
+        case SourceKind::File: return "IQ file";
         default: return "?";
     }
 }
@@ -18,8 +20,9 @@ Radio::Radio()
     : hwRing_(size_t(1) << 23),     // 8 MiB: ~1.3 s of 3.2 MSPS uint8 I/Q
       tapRing_(size_t(1) << 19),
       audioRing_(size_t(1) << 15),  // 16384 stereo frames (341 ms)
+      fileRing_(size_t(1) << 20),   // 1 M complex samples (8 MiB)
       receiver(audioRing_),
-      dsp(hwRing_, tapRing_, &receiver),
+      dsp(hwRing_, tapRing_, &receiver, &fileRing_),
       analyzer(tapRing_),
       audio(audioRing_) {
     // CM0-safe boot defaults; everything stays adjustable from the menu.
@@ -41,7 +44,7 @@ void Radio::init(const std::string& audioDevice, bool clampMixer) {
         std::string card = "hw:0";
         const size_t colon = audioDevice.find(':');
         if (colon != std::string::npos) card = "hw:" + audioDevice.substr(colon + 1, audioDevice.find(',') - colon - 1);
-        mixerReport = AlsaSink::clampMixer(card, -6.0f);
+        mixerReport = AudioSink::clampMixer(card, -6.0f);
     }
     analyzer.start();
     audio.start(audioDevice);
@@ -57,6 +60,7 @@ Source& Radio::source() {
     switch (kind_) {
         case SourceKind::RtlSdr: return rtl;
         case SourceKind::RtlTcp: return tcp;
+        case SourceKind::File: return file;
         default: return sim;
     }
 }
@@ -65,16 +69,31 @@ bool Radio::play() {
     if (playing_) return true;
     error_.clear();
     hwRing_.reset();
-    source().setCenterFrequency(centerHz_);
+    fileRing_.reset();
+    Source& src = source();
+    if (src.tunable()) src.setCenterFrequency(centerHz_);
+    else centerHz_ = src.centerFrequency();
     receiver.setOffset(vfo.offsetHz);
-    dsp.start(source().sampleRate());
-    if (!source().start(hwRing_)) {
+    dsp.start(src.sampleRate(), src.format() == SampleFormat::CF32 ? DspEngine::Input::CF32 : DspEngine::Input::U8);
+    if (!src.start(SourceRings{&hwRing_, &fileRing_})) {
         dsp.stop();
-        error_ = source().lastError().empty() ? std::string("source failed to start") : source().lastError();
+        error_ = src.lastError().empty() ? std::string("source failed to start") : src.lastError();
         return false;
     }
     playing_ = true;
     return true;
+}
+
+bool Radio::playWithFallback() {
+    if (play()) return true;
+    if (kind_ != SourceKind::RtlSdr) return false;
+    const std::string why = error_;
+    kind_ = SourceKind::Simulated;
+    sim.setSampleRate(rtl.sampleRate());
+    fallback_ = true;
+    const bool ok = play();
+    error_ = why + " - running simulator";
+    return ok;
 }
 
 void Radio::stop() {
@@ -85,22 +104,75 @@ void Radio::stop() {
 }
 
 void Radio::poll() {
-    if (playing_ && !source().running()) {  // device unplugged / server closed
-        error_ = source().lastError().empty() ? std::string("source stopped") : source().lastError();
-        dsp.stop();
-        playing_ = false;
+    const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (playing_ && !source().running()) {  // device unplugged / server closed / end of file
+        const std::string why = source().lastError().empty() ? std::string("source stopped") : source().lastError();
+        stop();
+        if (kind_ == SourceKind::RtlSdr) {
+            kind_ = SourceKind::Simulated;
+            sim.setSampleRate(rtl.sampleRate());
+            fallback_ = true;
+            play();
+            error_ = why + " - running simulator";
+            redetectAt_ = now + 2.0;
+        } else {
+            error_ = why;
+        }
+    }
+    // Re-detect: once the dongle is back, switch to it again.
+    if (fallback_ && kind_ == SourceKind::Simulated && now >= redetectAt_) {
+        redetectAt_ = now + 2.0;
+        if (RtlSdrSource::deviceCount() > 0) {
+            const bool was = playing_;
+            stop();
+            kind_ = SourceKind::RtlSdr;
+            rtl.setSampleRate(sim.sampleRate());
+            if (!was || play()) {
+                fallback_ = false;
+                error_ = "RTL-SDR detected";
+            } else {
+                kind_ = SourceKind::Simulated;  // still busy / no permission: keep simulating
+                play();
+            }
+        }
     }
 }
 
 void Radio::selectSource(SourceKind k) {
+    fallback_ = false;  // an explicit choice ends automatic fallback / re-detect
     if (k == kind_) return;
     const bool was = playing_;
     const double sr = source().sampleRate();
     stop();
     kind_ = k;
-    source().setSampleRate(sr);
-    source().setCenterFrequency(centerHz_);
+    if (source().tunable()) {
+        source().setSampleRate(sr);
+        source().setCenterFrequency(centerHz_);
+    } else {
+        centerHz_ = source().centerFrequency();
+        vfo.offsetHz = 0.0;
+        receiver.setOffset(0.0);
+    }
     if (was) play();
+}
+
+bool Radio::openFile(const std::string& path) {
+    const bool was = playing_;
+    if (kind_ == SourceKind::File) stop();
+    if (!file.open(path)) {
+        error_ = file.lastError();
+        if (was && kind_ == SourceKind::File) play();
+        return false;
+    }
+    if (file.info().centerHz <= 0) file.setCenterFrequency(centerHz_);  // unknown: keep the current label
+    if (kind_ != SourceKind::File) selectSource(SourceKind::File);
+    else {
+        centerHz_ = file.centerFrequency();
+        vfo.offsetHz = 0.0;
+        receiver.setOffset(0.0);
+    }
+    if (was) play();
+    return true;
 }
 
 void Radio::setSampleRate(double sps) {
@@ -108,15 +180,20 @@ void Radio::setSampleRate(double sps) {
     const bool was = playing_;
     stop();
     source().setSampleRate(sps);
-    const double lim = std::max(0.0, sps * 0.5 - vfo.bandwidthHz * 0.5);
-    vfo.offsetHz = std::clamp(vfo.offsetHz, -lim, lim);
-    receiver.setOffset(vfo.offsetHz);
+    tune(vfoHz());  // re-fit the VFO inside the new span
     if (was) play();
 }
 
 void Radio::setCenter(double hz) {
     hz = std::clamp(hz, 0.0, 9'999'999'999.0);
     if (hz == centerHz_) return;
+    if (!source().tunable()) {  // recording: the centre is fixed; only relabel it while stopped
+        if (!playing_) {
+            centerHz_ = hz;
+            source().setCenterFrequency(hz);
+        }
+        return;
+    }
     centerHz_ = hz;
     source().setCenterFrequency(hz);
 }
@@ -124,21 +201,32 @@ void Radio::setCenter(double hz) {
 void Radio::tune(double absHz) {
     absHz = std::clamp(absHz, 0.0, 9'999'999'999.0);
     const double sr = source().sampleRate();
-    if (tuningMode == TuningMode::Center) {
+    double lo = 0.0, hi = 0.0;
+    passband(lo, hi);
+    // VFO offsets that keep the whole passband inside the captured band.
+    const double minOff = -sr * 0.5 - lo, maxOff = sr * 0.5 - hi;
+    if (!source().tunable()) {  // IQ recording: move the VFO within the file's band only
+        vfo.offsetHz = std::clamp(absHz - centerHz_, std::min(minOff, 0.0), std::max(maxOff, 0.0));
+    } else if (tuningMode == TuningMode::Center) {
         vfo.offsetHz = 0.0;
         setCenter(absHz);
     } else {
-        const double lim = std::max(0.0, sr * 0.5 - vfo.bandwidthHz * 0.5);
         const double off = absHz - centerHz_;
-        if (std::fabs(off) <= lim) {
+        if (off >= minOff && off <= maxOff) {
             vfo.offsetHz = off;
         } else {
-            const double keep = std::clamp(vfo.offsetHz, -lim, lim);
+            const double keep = std::clamp(vfo.offsetHz, std::min(minOff, 0.0), std::max(maxOff, 0.0));
             setCenter(absHz - keep);
             vfo.offsetHz = absHz - centerHz_;
         }
     }
     receiver.setOffset(vfo.offsetHz);
+}
+
+void Radio::recall(double absHz, Demod mode, double bandwidthHz) {
+    if (mode != rx_.mode) setMode(mode);
+    if (bandwidthHz > 0) setBandwidth(bandwidthHz);
+    tune(absHz);
 }
 
 void Radio::setRx(const RxConfig& c) {
@@ -149,6 +237,7 @@ void Radio::setRx(const RxConfig& c) {
     vfo.minBandwidthHz = lim.minBw;
     vfo.maxBandwidthHz = lim.maxBw;
     receiver.setConfig(rx_);
+    tune(vfoHz());  // keep the (possibly asymmetric) passband inside the captured band
 }
 
 void Radio::setMode(Demod m) {

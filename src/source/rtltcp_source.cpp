@@ -32,8 +32,10 @@ void RtlTcpSource::command(uint8_t cmd, uint32_t param) {
     (void)::send(fd, pkt, sizeof(pkt), MSG_NOSIGNAL);
 }
 
-bool RtlTcpSource::start(RingBuffer<uint8_t>& out) {
+bool RtlTcpSource::start(const SourceRings& rings) {
     if (running_.load()) return true;
+    if (!rings.u8) return false;
+    RingBuffer<uint8_t>& out = *rings.u8;
     error_.clear();
 
     addrinfo hints{}, *res = nullptr;

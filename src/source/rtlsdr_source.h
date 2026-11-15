@@ -14,9 +14,14 @@ public:
     ~RtlSdrSource() override;
 
     static std::vector<std::string> listDevices();
+    static int deviceCount();
+    // USB transfer size for a sample rate: 262144 bytes (64 ms) at 2.048 MSPS,
+    // scaled down at lower rates so a block never exceeds ~64 ms of I/Q.
+    static uint32_t usbBlockBytes(double sampleRate);
 
     const char* name() const override { return "RTL-SDR"; }
-    bool start(RingBuffer<uint8_t>& out) override;
+    using Source::start;
+    bool start(const SourceRings& out) override;
     void stop() override;
     bool running() const override { return running_.load(); }
 

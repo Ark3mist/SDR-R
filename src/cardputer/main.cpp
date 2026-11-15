@@ -15,6 +15,7 @@
 #include "cardputer/input.h"
 #include "cardputer/ui.h"
 #include "cardputer/video.h"
+#include "engine/bookmarks.h"
 #include "engine/radio.h"
 
 namespace {
@@ -32,7 +33,7 @@ struct Options {
     double freq = 100.0e6;
     bool autostart = true;
     long frames = -1;
-    std::string screenshot, keys;
+    std::string screenshot, keys, bookmarks;
     int keyInterval = 4;
 };
 
@@ -48,6 +49,7 @@ void usage() {
         "  --source rtlsdr|rtltcp|sim   boot source (falls back to sim if it cannot start)\n"
         "  --freq HZ                    boot frequency\n"
         "  --no-autostart               boot stopped\n"
+        "  --bookmarks FILE             bookmark file (default ~/.config/cardsdr/bookmarks.json)\n"
         "  --frames N --screenshot F.bmp --keys \"TAB,2,DOWN,...\" --key-interval N   (diagnostics)");
 }
 
@@ -70,6 +72,7 @@ bool parse(int argc, char** argv, Options& o) {
         else if (a == "--source") o.source = next();
         else if (a == "--freq") o.freq = std::atof(next().c_str());
         else if (a == "--no-autostart") o.autostart = false;
+        else if (a == "--bookmarks") o.bookmarks = next();
         else if (a == "--frames") o.frames = std::atol(next().c_str());
         else if (a == "--screenshot") o.screenshot = next();
         else if (a == "--keys") o.keys = next();
@@ -129,7 +132,10 @@ int main(int argc, char** argv) {
     int rc = 0;
     {
         osx::Radio radio;
-        osx::CardUi ui(radio);
+        osx::BookmarkStore bookmarks(opt.bookmarks.empty() ? osx::BookmarkStore::defaultPath() : opt.bookmarks);
+        if (!bookmarks.load()) std::fprintf(stderr, "bookmarks: %s\n", bookmarks.lastError().c_str());
+        std::printf("bookmarks: %zu in %s\n", bookmarks.items().size(), bookmarks.path().c_str());
+        osx::CardUi ui(radio, bookmarks);
         if (!ui.initFonts(findFontDir(argv[0]))) std::fprintf(stderr, "pixel fonts not found, using the built-in font\n");
 
         radio.init(opt.audio, opt.mixerClamp);
@@ -139,12 +145,9 @@ int main(int argc, char** argv) {
         using SK = osx::Radio::SourceKind;
         radio.selectSource(opt.source == "sim" ? SK::Simulated : (opt.source == "rtltcp" ? SK::RtlTcp : SK::RtlSdr));
         radio.tune(opt.freq);
-        if (opt.autostart && !radio.play()) {
-            const std::string why = radio.lastError();
-            std::printf("source: %s -> falling back to the simulator\n", why.c_str());
-            radio.selectSource(SK::Simulated);
-            radio.play();
-            ui.toast(why + " - SIMULATOR", 4.0);
+        if (opt.autostart) {
+            radio.playWithFallback();  // RTL-SDR missing -> simulator, re-detected every 2 s
+            if (!radio.lastError().empty()) std::printf("source: %s\n", radio.lastError().c_str());
         }
 
         SDL_Texture* viewTex = SDL_CreateTexture(video.renderer(), SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,

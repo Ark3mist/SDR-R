@@ -34,7 +34,7 @@ inline float gauss(uint64_t& s) {
 
 const std::vector<SimSource::Emitter>& SimSource::bandPlan() {
     static const std::vector<Emitter> plan = {
-        {"WFM broadcast A", 0.0, -14.0f, Mod::WFM, 55e3f, 1000.0f},
+        {"WFM broadcast A (RDS)", 0.0, -14.0f, Mod::WFM, 55e3f, 1000.0f, true},
         {"NFM voice ch.", 400e3, -30.0f, Mod::NFM, 3e3f, 1200.0f},
         {"AM carrier", 600e3, -28.0f, Mod::AM, 0.0f, 700.0f},
         {"CW beacon", 750e3, -36.0f, Mod::CW, 0.0f, 9.0f},
@@ -45,7 +45,14 @@ const std::vector<SimSource::Emitter>& SimSource::bandPlan() {
     return plan;
 }
 
-SimSource::SimSource() : state_(bandPlan().size()) { expTable(); }
+const char* SimSource::simRdsPs() { return "OPENSDRX"; }
+const char* SimSource::simRdsRt() { return "Simulated RDS RadioText from OpenSDR-X"; }
+
+SimSource::SimSource() : state_(bandPlan().size()) {
+    expTable();
+    for (size_t e = 0; e < bandPlan().size(); ++e)
+        if (bandPlan()[e].rds) state_[e].rds = std::make_unique<RdsEncoder>(kSimRdsPi, kSimRdsPty, simRdsPs(), simRdsRt());
+}
 
 SimSource::~SimSource() { stop(); }
 
@@ -59,9 +66,10 @@ std::vector<float> SimSource::gainSteps() const {
     return g;
 }
 
-bool SimSource::start(RingBuffer<uint8_t>& out) {
+bool SimSource::start(const SourceRings& out) {
+    if (!out.u8) return false;
     if (running_.exchange(true)) return true;
-    thread_ = std::thread(&SimSource::run, this, &out);
+    thread_ = std::thread(&SimSource::run, this, out.u8);
     return true;
 }
 
@@ -101,13 +109,22 @@ void SimSource::generate(uint8_t* dst, size_t n) {
                     // Real stereo multiplex: L = tone, R = 3 x tone,
                     // mpx = 0.9 (M + S sin 2wp t) + 0.1 sin wp t (19 kHz pilot).
                     const uint32_t pilotInc = phaseInc(19e3, sr);
+                    const uint32_t rdsInc = phaseInc(rds::kBitRate, sr);
                     const double k = double(em.devHz) / sr * kTwo32;
                     for (size_t i = 0; i < n; ++i) {
                         const float l = tab[st.modPhase >> 16].imag();
                         const float r = tab[uint32_t(st.modPhase * 3u) >> 16].imag();
                         const float pilot = tab[st.pilotPhase >> 16].imag();
                         const float sub = tab[uint32_t(st.pilotPhase * 2u) >> 16].imag();
-                        const float m = 0.9f * (0.5f * (l + r) + 0.5f * (l - r) * sub) + 0.1f * pilot;
+                        float m = 0.86f * (0.5f * (l + r) + 0.5f * (l - r) * sub) + 0.1f * pilot;
+                        if (st.rds) {
+                            // RDS: biphase (one sine cycle per bit) BPSK on 57 kHz = 3 x pilot.
+                            const uint32_t prev = st.rdsPhase;
+                            st.rdsPhase += rdsInc;
+                            if (st.rdsPhase < prev) st.rdsSym = st.rds->nextBit() ? 1.0f : -1.0f;
+                            const float shape = tab[st.rdsPhase >> 16].imag();
+                            m += 0.04f * st.rdsSym * shape * tab[uint32_t(st.pilotPhase * 3u) >> 16].imag();
+                        }
                         st.modPhase += toneInc;
                         st.pilotPhase += pilotInc;
                         st.fmPhase += uint32_t(int32_t(k * m));
@@ -185,9 +202,25 @@ void SimSource::generate(uint8_t* dst, size_t n) {
         const float q = 127.5f + 127.5f * v;
         return uint8_t(q <= 0.0f ? 0 : (q >= 255.0f ? 255 : int(q + 0.5f)));
     };
+    const float qGain = std::pow(10.0f, iqGainErrDb.load(std::memory_order_relaxed) / 20.0f);
+    const float qPh = iqPhaseErrDeg.load(std::memory_order_relaxed) * float(std::numbers::pi / 180.0);
+    const float qc = qGain * std::cos(qPh), qs = qGain * std::sin(qPh);
+    const float rate = impulseRate.load(std::memory_order_relaxed);
+    const float pImp = rate > 0.0f ? float(double(rate) / sr) : 0.0f;
+    const float impAmp = std::pow(10.0f, impulseDb.load(std::memory_order_relaxed) / 20.0f);
     for (size_t i = 0; i < n; ++i) {
-        dst[2 * i] = quant(acc_[i].real() + sigma * gauss(rng_) + dc);
-        dst[2 * i + 1] = quant(acc_[i].imag() + sigma * gauss(rng_) + dc);
+        float re = acc_[i].real() + sigma * gauss(rng_);
+        float im = acc_[i].imag() + sigma * gauss(rng_);
+        if (pImp > 0.0f && float(xorshift(rng_) >> 40) * (1.0f / 16777216.0f) < pImp) impulseLeft_ = std::max(1, int(4e-6 * sr));
+        if (impulseLeft_ > 0) {  // ~4 us wideband spike
+            --impulseLeft_;
+            re += impAmp;
+            im -= impAmp * 0.7f;
+        }
+        // Q = g (I sin(phi) + Q cos(phi)): amplitude and phase skew of the Q path.
+        const float q = qs * re + qc * im;
+        dst[2 * i] = quant(re + dc);
+        dst[2 * i + 1] = quant(q + dc);
     }
 }
 

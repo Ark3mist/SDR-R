@@ -5,13 +5,14 @@
 
 #include <string>
 
-#include "audio/alsa_sink.h"
+#include "audio/audio_sink.h"
 #include "core/ring_buffer.h"
 #include "core/types.h"
 #include "core/vfo.h"
 #include "dsp/dsp_engine.h"
 #include "dsp/receiver.h"
 #include "dsp/spectrum_analyzer.h"
+#include "source/file_source.h"
 #include "source/rtlsdr_source.h"
 #include "source/rtltcp_source.h"
 #include "source/sim_source.h"
@@ -23,9 +24,10 @@ class Radio {
     RingBuffer<uint8_t> hwRing_;   // raw interleaved uint8 I/Q   (I/O -> DSP)
     RingBuffer<cf32> tapRing_;     // corrected baseband          (DSP -> FFT worker)
     RingBuffer<float> audioRing_;  // interleaved stereo float32  (DSP -> audio sink)
+    RingBuffer<cf32> fileRing_;    // complex float from the IQ file player (I/O -> DSP)
 
 public:
-    enum class SourceKind { Simulated = 0, RtlSdr, RtlTcp, Count };
+    enum class SourceKind { Simulated = 0, RtlSdr, RtlTcp, File, Count };
     enum class TuningMode { Normal = 0, Center };
     static const char* sourceKindName(SourceKind k);
 
@@ -40,7 +42,11 @@ public:
     bool play();                 // false: see lastError()
     void stop();
     bool playing() const { return playing_; }
-    void poll();                 // UI thread, once per frame: detects a lost source
+    // Like play(), but if the selected hardware cannot start, run the
+    // simulator instead and keep looking for the RTL-SDR (see poll()).
+    bool playWithFallback();
+    void poll();                 // UI thread, once per frame: lost source -> fallback; re-detect
+    bool fallbackActive() const { return fallback_; }
     const std::string& lastError() const { return error_; }
 
     // ---- source ----------------------------------------------------------------
@@ -52,6 +58,8 @@ public:
     SimSource sim;
     RtlSdrSource rtl;
     RtlTcpSource tcp;
+    FileSource file;
+    bool openFile(const std::string& path);   // selects the file source
 
     // ---- tuning ----------------------------------------------------------------
     void tune(double absHz);
@@ -66,11 +74,15 @@ public:
     void setRx(const RxConfig& c);              // pushes to the DSP thread
     void setMode(Demod m);                      // also loads the mode's default bandwidth / step
     void setBandwidth(double hz);
+    // Passband edges relative to the VFO (asymmetric for SSB).
+    void passband(double& lo, double& hi) const { osx::passband(rx_, lo, hi); }
+    // Tune + switch demodulator + bandwidth in one step (bookmarks).
+    void recall(double absHz, Demod mode, double bandwidthHz);
     Receiver receiver;
 
     DspEngine dsp;
     SpectrumAnalyzer analyzer;
-    AlsaSink audio;
+    AudioSink audio;
     std::string mixerReport;
 
 private:
@@ -78,6 +90,8 @@ private:
     RxConfig rx_;
     double centerHz_ = 100.0e6;
     bool playing_ = false;
+    bool fallback_ = false;              // running the simulator because the RTL-SDR is missing
+    double redetectAt_ = 0.0;
     std::string error_;
 };
 

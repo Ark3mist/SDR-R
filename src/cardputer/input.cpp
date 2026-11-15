@@ -15,11 +15,22 @@
 
 namespace osx {
 
+char shiftedChar(char c, bool shift) {
+    if (!shift) return c;
+    if (c >= 'a' && c <= 'z') return char(c - 'a' + 'A');
+    static const char* from = "1234567890-=[]\\;',./`";
+    static const char* to = "!@#$%^&*()_+{}|:\"<>?~";
+    for (size_t i = 0; from[i]; ++i)
+        if (from[i] == c) return to[i];
+    return c;
+}
+
 KeyEvent keyFromSdl(const SDL_Event& e) {
     KeyEvent k;
     if (e.type != SDL_KEYDOWN) return k;
     const SDL_Keycode sym = e.key.keysym.sym;
     k.shift = (e.key.keysym.mod & KMOD_SHIFT) != 0;
+    k.ctrl = (e.key.keysym.mod & KMOD_CTRL) != 0;
     switch (sym) {
         case SDLK_LEFT: k.key = Key::Left; break;
         case SDLK_RIGHT: k.key = Key::Right; break;
@@ -31,12 +42,16 @@ KeyEvent keyFromSdl(const SDL_Event& e) {
         case SDLK_BACKSPACE: case SDLK_DELETE: k.key = Key::Backspace; break;
         case SDLK_SPACE: k.key = Key::Space; break;
         case SDLK_KP_PERIOD: k.key = Key::Char; k.ch = '.'; break;
+        case SDLK_KP_PLUS: k.key = Key::Char; k.ch = '+'; break;
+        case SDLK_KP_MINUS: k.key = Key::Char; k.ch = '-'; break;
         default:
             if (sym >= SDLK_KP_1 && sym <= SDLK_KP_9) { k.key = Key::Char; k.ch = char('1' + (sym - SDLK_KP_1)); }
             else if (sym == SDLK_KP_0) { k.key = Key::Char; k.ch = '0'; }
             else if (sym > 32 && sym < 127) { k.key = Key::Char; k.ch = char(sym); }
             break;
     }
+    if (k.key == Key::Char) k.text = shiftedChar(k.ch, k.shift);
+    else if (k.key == Key::Space) k.text = ' ';
     return k;
 }
 
@@ -46,9 +61,10 @@ std::vector<KeyEvent> parseKeyScript(const std::string& script) {
     std::string tok;
     while (std::getline(ss, tok, ',')) {
         KeyEvent k;
-        if (tok.rfind("S-", 0) == 0 && tok.size() > 2) {
-            k.shift = true;
-            tok = tok.substr(2);
+        for (;;) {
+            if (tok.rfind("S-", 0) == 0 && tok.size() > 2) { k.shift = true; tok = tok.substr(2); }
+            else if (tok.rfind("C-", 0) == 0 && tok.size() > 2) { k.ctrl = true; tok = tok.substr(2); }
+            else break;
         }
         if (tok == "LEFT") k.key = Key::Left;
         else if (tok == "RIGHT") k.key = Key::Right;
@@ -60,8 +76,11 @@ std::vector<KeyEvent> parseKeyScript(const std::string& script) {
         else if (tok == "BKSP") k.key = Key::Backspace;
         else if (tok == "SPACE") k.key = Key::Space;
         else if (tok == "NOP") k.key = Key::None;
+        else if (tok == "COMMA") { k.key = Key::Char; k.ch = ','; }
         else if (tok.size() == 1) { k.key = Key::Char; k.ch = char(std::tolower(static_cast<unsigned char>(tok[0]))); }
         else continue;
+        if (k.key == Key::Char) k.text = shiftedChar(k.ch, k.shift);
+        else if (k.key == Key::Space) k.text = ' ';
         out.push_back(k);
     }
     return out;
@@ -85,7 +104,7 @@ char charForCode(int code) {
         {KEY_KP7, '7'}, {KEY_KP8, '8'}, {KEY_KP9, '9'}, {KEY_KP0, '0'}, {KEY_KPDOT, '.'},
         {KEY_DOT, '.'}, {KEY_COMMA, ','}, {KEY_SLASH, '/'}, {KEY_SEMICOLON, ';'}, {KEY_MINUS, '-'},
         {KEY_EQUAL, '='}, {KEY_GRAVE, '`'}, {KEY_APOSTROPHE, '\''}, {KEY_LEFTBRACE, '['}, {KEY_RIGHTBRACE, ']'},
-        {KEY_BACKSLASH, '\\'},
+        {KEY_BACKSLASH, '\\'}, {KEY_KPPLUS, '+'}, {KEY_KPMINUS, '-'},
     };
     for (const auto& m : map)
         if (m.code == code) return m.ch;
@@ -134,9 +153,11 @@ void EvdevKeyboard::poll(std::vector<KeyEvent>& out) {
                 if (ev[i].type != EV_KEY) continue;
                 const int code = ev[i].code, value = ev[i].value;  // 0 up, 1 down, 2 auto-repeat
                 if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT) { shift_ = value != 0; continue; }
+                if (code == KEY_LEFTCTRL || code == KEY_RIGHTCTRL) { ctrl_ = value != 0; continue; }
                 if (value == 0) continue;
                 KeyEvent k;
                 k.shift = shift_;
+                k.ctrl = ctrl_;
                 switch (code) {
                     case KEY_LEFT: k.key = Key::Left; break;
                     case KEY_RIGHT: k.key = Key::Right; break;
@@ -151,6 +172,8 @@ void EvdevKeyboard::poll(std::vector<KeyEvent>& out) {
                         if (const char c = charForCode(code)) { k.key = Key::Char; k.ch = c; }
                         break;
                 }
+                if (k.key == Key::Char) k.text = shiftedChar(k.ch, k.shift);
+                else if (k.key == Key::Space) k.text = ' ';
                 if (k.key != Key::None) out.push_back(k);
             }
         }
